@@ -3,7 +3,6 @@ const fetch = require("node-fetch");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── CACHE (5 minutes per player) ─────────────────────────────
 const cache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
@@ -21,12 +20,18 @@ function setCache(key, data) {
     cache.set(key, { data, time: Date.now() });
 }
 
-// ── PING (keeps Render awake) ─────────────────────────────────
 app.get("/ping", (req, res) => {
     res.send("pong");
 });
 
-// ── CLOTHING: shirts, pants, t-shirts ────────────────────────
+app.get("/refresh/:userId", async (req, res) => {
+    const userId = req.params.userId;
+    cache.delete("clothing_" + userId);
+    cache.delete("passes_" + userId);
+    cache.delete("all_" + userId);
+    res.json({ success: true, message: "Cache cleared for " + userId });
+});
+
 app.get("/clothing/:userId", async (req, res) => {
     const userId = req.params.userId;
     const cacheKey = "clothing_" + userId;
@@ -54,7 +59,6 @@ app.get("/clothing/:userId", async (req, res) => {
     }
 });
 
-// ── GAMEPASSES ────────────────────────────────────────────────
 app.get("/gamepasses/:userId", async (req, res) => {
     const userId = req.params.userId;
     const cacheKey = "passes_" + userId;
@@ -98,7 +102,6 @@ app.get("/gamepasses/:userId", async (req, res) => {
     }
 });
 
-// ── ALL ITEMS COMBINED ────────────────────────────────────────
 app.get("/all/:userId", async (req, res) => {
     const userId = req.params.userId;
     const cacheKey = "all_" + userId;
