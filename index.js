@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 3000;
 
 const cache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
-const METRICS_TTL = 90 * 1000; // 1.5 minutes for stock metrics
+const METRICS_TTL = 90 * 1000;
 
 function getCache(key) {
     const entry = cache.get(key);
@@ -21,7 +21,24 @@ function setCache(key, data, ttl) {
     cache.set(key, { data, time: Date.now(), ttl: ttl || CACHE_TTL });
 }
 
-// ── PING ─────────────────────────────────────────────────────
+// ── CONVERT GAME ID TO UNIVERSE ID ───────────────────────────
+async function toUniverseId(gameId) {
+    const cacheKey = "universe_" + gameId;
+    const cached = getCache(cacheKey);
+    if (cached) return cached;
+
+    const res = await fetch(
+        `https://apis.roblox.com/universes/v1/places/${gameId}/universe`
+    );
+    const data = await res.json();
+
+    if (!data.universeId) throw new Error("Could not convert game ID to universe ID");
+
+    setCache(cacheKey, data.universeId, 24 * 60 * 60 * 1000); // cache for 24 hours (never changes)
+    return data.universeId;
+}
+
+// ── PING ──────────────────────────────────────────────────────
 app.get("/ping", (req, res) => {
     res.send("pong");
 });
@@ -35,15 +52,19 @@ app.get("/refresh/:userId", async (req, res) => {
     res.json({ success: true, message: "Cache cleared for " + userId });
 });
 
-// ── GAME METRICS (for stocks) ─────────────────────────────────
-app.get("/metrics/:universeId", async (req, res) => {
-    const universeId = req.params.universeId;
-    const cacheKey = "metrics_" + universeId;
-    const cached = getCache(cacheKey);
-    if (cached) return res.json(cached);
+// ── GAME METRICS (pass game ID, auto converts to universe ID) ─
+app.get("/metrics/:gameId", async (req, res) => {
+    const gameId = req.params.gameId;
 
     try {
-        // Fetch game details (active players, visits, votes)
+        // Auto convert game ID → universe ID
+        const universeId = await toUniverseId(gameId);
+
+        const cacheKey = "metrics_" + universeId;
+        const cached = getCache(cacheKey);
+        if (cached) return res.json(cached);
+
+        // Fetch game details and votes in parallel
         const [detailsRes, votesRes] = await Promise.all([
             fetch(`https://games.roblox.com/v1/games?universeIds=${universeId}`),
             fetch(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`)
@@ -59,15 +80,10 @@ app.get("/metrics/:universeId", async (req, res) => {
             return res.status(404).json({ error: "Game not found" });
         }
 
-        // Active players right now
         const activePlayers = game.playing || 0;
-
-        // Total visits — we use this to calculate visits per minute
         const totalVisits = game.visits || 0;
 
-        // Visits per minute — we calculate by comparing two fetches
-        // First time: store visits + timestamp, return 0
-        // Second time onwards: calculate difference
+        // Visits per minute calculation
         const prevKey = "prev_visits_" + universeId;
         const prev = cache.get(prevKey);
         let visitsPerMinute = 0;
@@ -80,7 +96,6 @@ app.get("/metrics/:universeId", async (req, res) => {
                 : 0;
         }
 
-        // Store current visits for next comparison
         cache.set(prevKey, { visits: totalVisits, time: Date.now() });
 
         // Like/dislike ratio
@@ -99,8 +114,9 @@ app.get("/metrics/:universeId", async (req, res) => {
 
         setCache(cacheKey, result, METRICS_TTL);
         res.json(result);
+
     } catch (e) {
-        res.status(500).json({ error: "Failed to fetch metrics" });
+        res.status(500).json({ error: "Failed to fetch metrics: " + e.message });
     }
 });
 
