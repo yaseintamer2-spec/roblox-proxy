@@ -5,25 +5,28 @@ const PORT = process.env.PORT || 3000;
 
 const cache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
+const METRICS_TTL = 90 * 1000; // 1.5 minutes for stock metrics
 
 function getCache(key) {
     const entry = cache.get(key);
     if (!entry) return null;
-    if (Date.now() - entry.time > CACHE_TTL) {
+    if (Date.now() - entry.time > entry.ttl) {
         cache.delete(key);
         return null;
     }
     return entry.data;
 }
 
-function setCache(key, data) {
-    cache.set(key, { data, time: Date.now() });
+function setCache(key, data, ttl) {
+    cache.set(key, { data, time: Date.now(), ttl: ttl || CACHE_TTL });
 }
 
+// ── PING ─────────────────────────────────────────────────────
 app.get("/ping", (req, res) => {
     res.send("pong");
 });
 
+// ── REFRESH USER CACHE ────────────────────────────────────────
 app.get("/refresh/:userId", async (req, res) => {
     const userId = req.params.userId;
     cache.delete("clothing_" + userId);
@@ -32,6 +35,76 @@ app.get("/refresh/:userId", async (req, res) => {
     res.json({ success: true, message: "Cache cleared for " + userId });
 });
 
+// ── GAME METRICS (for stocks) ─────────────────────────────────
+app.get("/metrics/:universeId", async (req, res) => {
+    const universeId = req.params.universeId;
+    const cacheKey = "metrics_" + universeId;
+    const cached = getCache(cacheKey);
+    if (cached) return res.json(cached);
+
+    try {
+        // Fetch game details (active players, visits, votes)
+        const [detailsRes, votesRes] = await Promise.all([
+            fetch(`https://games.roblox.com/v1/games?universeIds=${universeId}`),
+            fetch(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`)
+        ]);
+
+        const detailsData = await detailsRes.json();
+        const votesData = await votesRes.json();
+
+        const game = (detailsData.data || [])[0];
+        const votes = (votesData.data || [])[0];
+
+        if (!game) {
+            return res.status(404).json({ error: "Game not found" });
+        }
+
+        // Active players right now
+        const activePlayers = game.playing || 0;
+
+        // Total visits — we use this to calculate visits per minute
+        const totalVisits = game.visits || 0;
+
+        // Visits per minute — we calculate by comparing two fetches
+        // First time: store visits + timestamp, return 0
+        // Second time onwards: calculate difference
+        const prevKey = "prev_visits_" + universeId;
+        const prev = cache.get(prevKey);
+        let visitsPerMinute = 0;
+
+        if (prev) {
+            const minutesElapsed = (Date.now() - prev.time) / 60000;
+            const visitDiff = totalVisits - prev.visits;
+            visitsPerMinute = minutesElapsed > 0
+                ? Math.round(visitDiff / minutesElapsed)
+                : 0;
+        }
+
+        // Store current visits for next comparison
+        cache.set(prevKey, { visits: totalVisits, time: Date.now() });
+
+        // Like/dislike ratio
+        const upVotes = votes ? votes.upVotes || 0 : 0;
+        const downVotes = votes ? votes.downVotes || 0 : 0;
+        const totalVotes = upVotes + downVotes;
+        const likeDislikeRatio = totalVotes > 0
+            ? Math.round((upVotes / totalVotes) * 1000) / 10
+            : 0;
+
+        const result = {
+            activePlayers,
+            visitsPerMinute: Math.max(0, visitsPerMinute),
+            likeDislikeRatio
+        };
+
+        setCache(cacheKey, result, METRICS_TTL);
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: "Failed to fetch metrics" });
+    }
+});
+
+// ── CLOTHING ──────────────────────────────────────────────────
 app.get("/clothing/:userId", async (req, res) => {
     const userId = req.params.userId;
     const cacheKey = "clothing_" + userId;
@@ -52,13 +125,14 @@ app.get("/clothing/:userId", async (req, res) => {
                 type: "Clothing"
             }));
 
-        setCache(cacheKey, items);
+        setCache(cacheKey, items, CACHE_TTL);
         res.json(items);
     } catch (e) {
         res.status(500).json({ error: "Failed to fetch clothing" });
     }
 });
 
+// ── GAMEPASSES ────────────────────────────────────────────────
 app.get("/gamepasses/:userId", async (req, res) => {
     const userId = req.params.userId;
     const cacheKey = "passes_" + userId;
@@ -95,13 +169,14 @@ app.get("/gamepasses/:userId", async (req, res) => {
             } catch (_) {}
         }));
 
-        setCache(cacheKey, passes);
+        setCache(cacheKey, passes, CACHE_TTL);
         res.json(passes);
     } catch (e) {
         res.status(500).json({ error: "Failed to fetch gamepasses" });
     }
 });
 
+// ── ALL ITEMS COMBINED ────────────────────────────────────────
 app.get("/all/:userId", async (req, res) => {
     const userId = req.params.userId;
     const cacheKey = "all_" + userId;
@@ -121,7 +196,7 @@ app.get("/all/:userId", async (req, res) => {
             ...(Array.isArray(passes) ? passes : [])
         ];
 
-        setCache(cacheKey, all);
+        setCache(cacheKey, all, CACHE_TTL);
         res.json(all);
     } catch (e) {
         res.status(500).json({ error: "Failed to fetch all items" });
